@@ -67,20 +67,33 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
   // Legs are identified by gameId + key — game-line legs share matrix keys
   // ("game_total", "home_margin") across games, so the gameId is what keeps
   // a total leg in game A distinct from one in game B.
-  const inSlip = (gameId: string, key: string, side: "over" | "under") =>
+  const inSlip = (
+    gameId: string,
+    key: string,
+    side: "over" | "under",
+    point: number,
+  ) =>
     slip.some(
-      (l) => l.gameId === gameId && l.key === key && l.side === side,
+      (l) =>
+        l.gameId === gameId &&
+        l.key === key &&
+        l.side === side &&
+        l.point === point,
     );
 
   function toggle(leg: Leg, marketOdds: number | null) {
     setSlip((prev) => {
+      // Same slot = same game + matrix key (ML and spread share `home_margin`).
       const sameSlot = (l: SlipLeg) =>
         l.gameId === leg.gameId && l.key === leg.key;
-      if (prev.some((l) => sameSlot(l) && l.side === leg.side)) {
-        return prev.filter((l) => !(sameSlot(l) && l.side === leg.side));
+      // Same leg = same slot, side, and line — clicking it again toggles off.
+      const sameLeg = (l: SlipLeg) =>
+        sameSlot(l) && l.side === leg.side && l.point === leg.point;
+      if (prev.some(sameLeg)) {
+        return prev.filter((l) => !sameLeg(l));
       }
-      // Drop the opposite side of this same slot — enforces mutual exclusion
-      // (over vs under of a prop/total, home vs away of an ML/spread).
+      // Otherwise drop whatever else holds this slot — enforces mutual
+      // exclusion (prop over vs under, ML vs spread vs the other side).
       return [...prev.filter((l) => !sameSlot(l)), { ...leg, marketOdds }];
     });
   }
@@ -232,7 +245,12 @@ function GameCard({
   sg: SlateGame;
   open: boolean;
   onToggleOpen: () => void;
-  inSlip: (gameId: string, key: string, side: "over" | "under") => boolean;
+  inSlip: (
+    gameId: string,
+    key: string,
+    side: "over" | "under",
+    point: number,
+  ) => boolean;
   toggle: (leg: Leg, marketOdds: number | null) => void;
 }) {
   const { game, sport, market } = sg;
@@ -280,7 +298,7 @@ function GameCard({
                 <GameLineRow
                   key={`${o.market}:${o.side}`}
                   opt={o}
-                  active={inSlip(game.gameId, o.leg.key, o.leg.side)}
+                  active={inSlip(game.gameId, o.leg.key, o.leg.side, o.leg.point)}
                   onClick={() => toggle(o.leg, o.marketOdds)}
                 />
               ))}
@@ -325,13 +343,17 @@ function GameCard({
                             </span>
                             <button
                               onClick={() => toggle(mk("over"), null)}
-                              className={btnCls(inSlip(game.gameId, key, "over"))}
+                              className={btnCls(
+                                inSlip(game.gameId, key, "over", p.line.point),
+                              )}
                             >
                               O
                             </button>
                             <button
                               onClick={() => toggle(mk("under"), null)}
-                              className={btnCls(inSlip(game.gameId, key, "under"))}
+                              className={btnCls(
+                                inSlip(game.gameId, key, "under", p.line.point),
+                              )}
                             >
                               U
                             </button>
