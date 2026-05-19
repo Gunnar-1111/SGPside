@@ -23,12 +23,12 @@ function erf(x: number): number {
   return s * y;
 }
 
-function normCdf(x: number): number {
+export function normCdf(x: number): number {
   return 0.5 * (1 + erf(x / Math.SQRT2));
 }
 
 /** Inverse standard-normal CDF — Acklam's rational approximation. */
-function normInv(p: number): number {
+export function normInv(p: number): number {
   if (p <= 0) return -8;
   if (p >= 1) return 8;
   const a = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2,
@@ -97,7 +97,8 @@ function cholesky(A: number[][]): number[][] {
 // ── SGP leg + price ────────────────────────────────────────────
 
 export interface Leg {
-  key: string; // "<playerId>:<market>" — matches a contract correlation key
+  key: string;     // "<playerId>:<market>" — matches a contract correlation key
+  gameId: string;  // which game's correlation block applies to this leg
   label: string;
   point: number;
   side: "over" | "under";
@@ -124,12 +125,19 @@ const MC_SIMS = 20000;
 const HOLD_PER_LEG = 0.012;
 
 /**
- * Price a same-game parlay. Joint probability comes from a Gaussian copula:
- * each leg gets a standard-normal latent; the legs' sub-matrix of the
- * contract correlation matrix is Cholesky-factored; Monte Carlo counts the
- * fraction of draws where every leg clears its threshold.
+ * Price a parlay — same-game OR cross-game / cross-sport. Joint probability
+ * comes from a Gaussian copula: each leg gets a standard-normal latent, the
+ * legs' correlation sub-matrix is Cholesky-factored, and Monte Carlo counts
+ * the fraction of draws where every leg clears its threshold.
+ *
+ * `corrByGame` maps gameId → that game's correlation block. Correlation only
+ * applies between legs of the SAME game; legs from different games (a true
+ * cross-game parlay) are independent.
  */
-export function priceSGP(legs: Leg[], corr: CorrelationBlock | null): SGPPrice {
+export function priceSGP(
+  legs: Leg[],
+  corrByGame: Record<string, CorrelationBlock | null>,
+): SGPPrice {
   const n = legs.length;
   const q = legs.map((l) => pOver(l.projection, l.point)); // P(stat > point)
   const marginal = legs.map((l, i) => (l.side === "over" ? q[i] : 1 - q[i]));
@@ -140,13 +148,22 @@ export function priceSGP(legs: Leg[], corr: CorrelationBlock | null): SGPPrice {
   if (n <= 1) {
     jointProb = marginal[0] ?? 0;
   } else {
-    const keyIndex = new Map((corr?.keys ?? []).map((k, i) => [k, i]));
-    const R: number[][] = legs.map((la) =>
-      legs.map((lb) => {
-        if (la.key === lb.key) return 1;
-        const a = keyIndex.get(la.key);
-        const b = keyIndex.get(lb.key);
-        return a != null && b != null && corr ? corr.matrix[a][b] : 0;
+    // Per-game key→index maps. A leg pair is correlated only when both legs
+    // belong to the same game and both keys appear in that game's block.
+    const idxByGame = new Map<string, Map<string, number>>();
+    for (const [gid, block] of Object.entries(corrByGame)) {
+      idxByGame.set(gid, new Map((block?.keys ?? []).map((k, i) => [k, i])));
+    }
+    const R: number[][] = legs.map((la, i) =>
+      legs.map((lb, j) => {
+        if (i === j) return 1;
+        if (la.gameId !== lb.gameId) return 0; // cross-game → independent
+        const block = corrByGame[la.gameId];
+        const idx = idxByGame.get(la.gameId);
+        if (!block || !idx) return 0;
+        const a = idx.get(la.key);
+        const b = idx.get(lb.key);
+        return a != null && b != null ? block.matrix[a][b] : 0;
       }),
     );
     const L = cholesky(R);

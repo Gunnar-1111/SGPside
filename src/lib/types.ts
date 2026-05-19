@@ -55,3 +55,14 @@ export interface ContractDoc {
   modelVersion: string;
   games: Game[];
 }
+
+// One game on the hub's slate — a contract Game plus the engine/sport/date
+// provenance and the live market line. Built server-side, passed to the
+// builder. (MarketLines lives in espn-lines.ts; imported type-only.)
+export interface SlateGame {
+  engine: string;
+  sport: string;
+  date: string;
+  game: Game;
+  market: import("./espn-lines").MarketLines | null;
+}
