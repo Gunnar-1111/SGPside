@@ -125,10 +125,15 @@ export function gameLineOptions(
     };
   };
 
-  // ── Total — game total ~ Normal(total, totalStdev) ───────────
+  // ── Total — game total ~ Normal(mean, totalStdev) ────────────
+  // Center on the market total when posted (mirrors how the contract's player
+  // projections are now market-conditioned via overrideTotal). Our model
+  // total is preserved as `modelPoint` for the picker's model-vs-market
+  // display. Std is the sim's totalStdev (unchanged).
   const totalSd = game.lines.totalStdev ?? FALLBACK_TOTAL_STD;
   const betTotal = market?.total ?? total;
-  const pOver = 1 - normCdf((betTotal - total) / totalSd);
+  const totalMean = market?.total ?? total;
+  const pOver = 1 - normCdf((betTotal - totalMean) / totalSd);
 
   const totalLeg = (side: "over" | "under"): GameLineOption => {
     const prob = side === "over" ? pOver : 1 - pOver;
@@ -146,7 +151,7 @@ export function gameLineOptions(
         label: `${home}/${away} ${side === "over" ? "o" : "u"}${betTotal}`,
         point: betTotal,
         side,
-        projection: { mean: total, stdev: totalSd, distribution: "normal" },
+        projection: { mean: totalMean, stdev: totalSd, distribution: "normal" },
         juicedOdds: probToAmericanVigged(prob),
       },
     };
