@@ -4,15 +4,18 @@
 // totalStdev, home/away win prob). That's enough to derive every game leg
 // WITHOUT sport knowledge:
 //
-//   • Moneyline — a Bernoulli leg; P(side) is the contract win prob directly.
-//   • Spread    — home margin ~ Normal(μ, σ). μ = −homeSpread; σ is BACKED OUT
-//                 of the contract: homeWinProb = Φ(μ/σ) ⇒ σ = μ / Φ⁻¹(p).
+//   • Moneyline — home margin > 0. Same latent as the spread; σ is BACKED OUT
+//                 of the contract (homeWinProb = Φ(μ/σ) ⇒ σ = μ / Φ⁻¹(p)), so
+//                 P(margin > 0) = homeWinProb — the marginal is unchanged.
+//   • Spread    — home margin ~ Normal(μ, σ), same μ/σ as the moneyline.
 //   • Total     — game total ~ Normal(total, totalStdev). totalStdev is now
 //                 carried by the contract (engines emit their sim's stdev).
 //
-// Spread legs key to `home_margin` and total legs to `game_total` — the two
-// game-level keys in the contract correlation matrix — so they correlate
-// with player props through the copula (e.g. game_total ↔ points ≈ +0.18).
+// Moneyline + spread legs key to `home_margin`, total legs to `game_total` —
+// the two game-level keys in the contract correlation matrix — so they
+// correlate with player props through the copula. A Knicks scorer's points
+// and a Knicks moneyline/spread now lift together (home_margin ↔ a home
+// player's points is positive; ↔ a road player's is negative).
 //
 // Each option carries the ESPN market number alongside the model number so
 // the hub can show model-vs-market per leg.
@@ -59,8 +62,15 @@ export function gameLineOptions(
   const { homeSpread, total, homeWinProb, awayWinProb } = game.lines;
   const fmt = (n: number) => (n > 0 ? `+${n}` : `${n}`);
 
-  // ── Moneyline — Bernoulli, mean = contract win prob ──────────
-  const mlKey = `${gameId}:line:ml`;
+  // Home margin ~ Normal(μ, σ). Both moneyline AND spread legs are bets on
+  // this same latent, so both key to `home_margin` and correlate with player
+  // props through the copula. σ is backed out of the contract (see marginStd);
+  // P(margin > 0) then equals homeWinProb exactly, so the ML marginal is
+  // unchanged — it's just correlation-aware now.
+  const mu = -homeSpread; // expected home margin
+  const sd = marginStd(game);
+
+  // ── Moneyline — home margin > 0 ──────────────────────────────
   const ml = (side: "home" | "away"): GameLineOption => {
     const prob = side === "home" ? homeWinProb : awayWinProb;
     const team = side === "home" ? home : away;
@@ -73,19 +83,17 @@ export function gameLineOptions(
       marketOdds: side === "home" ? market?.homeML ?? null : market?.awayML ?? null,
       marketPoint: null,
       leg: {
-        key: mlKey,
+        key: "home_margin", // matrix game-level key — correlates with props
         gameId,
         label: `${team} ML`,
-        point: 0,
-        side: "over", // Bernoulli ignores side; the projection mean is the prob
-        projection: { mean: prob, stdev: null, distribution: "bernoulli" },
+        point: 0, // home wins ⇔ home margin > 0
+        side: side === "home" ? "over" : "under",
+        projection: { mean: mu, stdev: sd, distribution: "normal" },
       },
     };
   };
 
   // ── Spread — home margin ~ Normal(μ, σ) ──────────────────────
-  const mu = -homeSpread; // expected home margin
-  const sd = marginStd(game);
   const betSpread = market?.homeSpread ?? homeSpread; // home perspective
   const spreadThr = -betSpread; // home covers ⇔ home margin > spreadThr
   const pHomeCovers = 1 - normCdf((spreadThr - mu) / sd);
