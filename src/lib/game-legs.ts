@@ -1,16 +1,18 @@
-// Game-line legs — moneyline and spread legs built from a contract Game.
+// Game-line legs — moneyline, spread, and total legs built from a contract Game.
 //
-// The contract is sport-agnostic: a Game carries only `lines` (homeSpread,
-// total, home/away win prob). That's enough to derive ML and SPREAD legs
-// WITHOUT any sport knowledge:
+// The contract is sport-agnostic: a Game carries `lines` (homeSpread, total,
+// totalStdev, home/away win prob). That's enough to derive every game leg
+// WITHOUT sport knowledge:
 //
 //   • Moneyline — a Bernoulli leg; P(side) is the contract win prob directly.
 //   • Spread    — home margin ~ Normal(μ, σ). μ = −homeSpread; σ is BACKED OUT
 //                 of the contract: homeWinProb = Φ(μ/σ) ⇒ σ = μ / Φ⁻¹(p).
+//   • Total     — game total ~ Normal(total, totalStdev). totalStdev is now
+//                 carried by the contract (engines emit their sim's stdev).
 //
-// Total legs are intentionally omitted — total variance can't be recovered
-// from the contract (win prob constrains the margin, not the total). They
-// need a `totalStdev` field added to the contract first.
+// Spread legs key to `home_margin` and total legs to `game_total` — the two
+// game-level keys in the contract correlation matrix — so they correlate
+// with player props through the copula (e.g. game_total ↔ points ≈ +0.18).
 //
 // Each option carries the ESPN market number alongside the model number so
 // the hub can show model-vs-market per leg.
@@ -21,6 +23,7 @@ import type { Leg } from "./sgp-pricer";
 import { normCdf, normInv, probToAmerican } from "./sgp-pricer";
 
 const FALLBACK_MARGIN_STD = 13; // used only at ~pick'em, where μ≈0 ⇒ σ undefined
+const FALLBACK_TOTAL_STD = 14; // used when a contract predates the totalStdev field
 
 /** Home-margin std implied by the contract (see file header). */
 function marginStd(game: Game): number {
@@ -32,27 +35,29 @@ function marginStd(game: Game): number {
 }
 
 export interface GameLineOption {
-  market: "ml" | "spread";
-  side: "home" | "away";
+  market: "ml" | "spread" | "total";
+  side: "home" | "away" | "over" | "under";
   label: string;
   modelOdds: number; // model's fair American for this side
-  modelPoint: number | null; // model spread (spread legs only)
-  marketOdds: number | null; // ESPN American for this side
-  marketPoint: number | null; // ESPN spread (spread legs only)
+  modelPoint: number | null; // model spread / total (not ML)
+  marketOdds: number | null; // ESPN American (ML only — ESPN gives no prop juice)
+  marketPoint: number | null; // ESPN spread / total
   leg: Leg;
 }
 
 /**
- * The four game-line options for a game: ML home/away, spread home/away.
- * Spread legs are priced against the *market* number when one is available
- * (that's the line you'd actually bet) so model-vs-market is a fair test.
+ * Game-line options for a game: ML home/away, spread home/away, total
+ * over/under. Spread and total legs are priced against the *market* number
+ * when one is posted (that's the line you'd actually bet) so model-vs-market
+ * is a fair test.
  */
 export function gameLineOptions(
   game: Game,
   market: MarketLines | null,
 ): GameLineOption[] {
   const { home, away, gameId } = game;
-  const { homeSpread, homeWinProb, awayWinProb } = game.lines;
+  const { homeSpread, total, homeWinProb, awayWinProb } = game.lines;
+  const fmt = (n: number) => (n > 0 ? `+${n}` : `${n}`);
 
   // ── Moneyline — Bernoulli, mean = contract win prob ──────────
   const mlKey = `${gameId}:line:ml`;
@@ -81,12 +86,9 @@ export function gameLineOptions(
   // ── Spread — home margin ~ Normal(μ, σ) ──────────────────────
   const mu = -homeSpread; // expected home margin
   const sd = marginStd(game);
-  // Bet line: the market spread if posted, else the model's own spread.
   const betSpread = market?.homeSpread ?? homeSpread; // home perspective
-  const threshold = -betSpread; // home covers ⇔ home margin > threshold
-  const spreadKey = `${gameId}:line:spread`;
-  const pHomeCovers = 1 - normCdf((threshold - mu) / sd);
-  const fmt = (n: number) => (n > 0 ? `+${n}` : `${n}`);
+  const spreadThr = -betSpread; // home covers ⇔ home margin > spreadThr
+  const pHomeCovers = 1 - normCdf((spreadThr - mu) / sd);
 
   const spread = (side: "home" | "away"): GameLineOption => {
     const team = side === "home" ? home : away;
@@ -103,15 +105,45 @@ export function gameLineOptions(
         ? market?.homeSpread ?? null
         : market?.homeSpread != null ? -market.homeSpread : null,
       leg: {
-        key: spreadKey,
+        key: "home_margin", // matrix game-level key — correlates with props
         gameId,
         label: `${team} ${fmt(teamSpread)}`,
-        point: threshold, // home margin threshold
+        point: spreadThr,
         side: side === "home" ? "over" : "under",
         projection: { mean: mu, stdev: sd, distribution: "normal" },
       },
     };
   };
 
-  return [ml("home"), ml("away"), spread("home"), spread("away")];
+  // ── Total — game total ~ Normal(total, totalStdev) ───────────
+  const totalSd = game.lines.totalStdev ?? FALLBACK_TOTAL_STD;
+  const betTotal = market?.total ?? total;
+  const pOver = 1 - normCdf((betTotal - total) / totalSd);
+
+  const totalLeg = (side: "over" | "under"): GameLineOption => {
+    const prob = side === "over" ? pOver : 1 - pOver;
+    return {
+      market: "total",
+      side,
+      label: `${side === "over" ? "Over" : "Under"} ${betTotal}`,
+      modelOdds: probToAmerican(prob),
+      modelPoint: total,
+      marketOdds: null, // ESPN gives the total number, not the o/u juice
+      marketPoint: market?.total ?? null,
+      leg: {
+        key: "game_total", // matrix game-level key — correlates with props
+        gameId,
+        label: `${home}/${away} ${side === "over" ? "o" : "u"}${betTotal}`,
+        point: betTotal,
+        side,
+        projection: { mean: total, stdev: totalSd, distribution: "normal" },
+      },
+    };
+  };
+
+  return [
+    ml("home"), ml("away"),
+    spread("home"), spread("away"),
+    totalLeg("over"), totalLeg("under"),
+  ];
 }
