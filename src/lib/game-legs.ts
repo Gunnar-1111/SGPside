@@ -23,7 +23,7 @@
 import type { Game } from "./types";
 import type { MarketLines } from "./espn-lines";
 import type { Leg } from "./sgp-pricer";
-import { normCdf, normInv, probToAmerican } from "./sgp-pricer";
+import { normCdf, normInv, probToAmerican, probToAmericanVigged } from "./sgp-pricer";
 
 const FALLBACK_MARGIN_STD = 13; // used only at ~pick'em, where μ≈0 ⇒ σ undefined
 const FALLBACK_TOTAL_STD = 14; // used when a contract predates the totalStdev field
@@ -89,6 +89,7 @@ export function gameLineOptions(
         point: 0, // home wins ⇔ home margin > 0
         side: side === "home" ? "over" : "under",
         projection: { mean: mu, stdev: sd, distribution: "normal" },
+        juicedOdds: probToAmericanVigged(prob),
       },
     };
   };
@@ -119,6 +120,7 @@ export function gameLineOptions(
         point: spreadThr,
         side: side === "home" ? "over" : "under",
         projection: { mean: mu, stdev: sd, distribution: "normal" },
+        juicedOdds: probToAmericanVigged(prob),
       },
     };
   };
@@ -145,6 +147,7 @@ export function gameLineOptions(
         point: betTotal,
         side,
         projection: { mean: total, stdev: totalSd, distribution: "normal" },
+        juicedOdds: probToAmericanVigged(prob),
       },
     };
   };

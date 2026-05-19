@@ -173,8 +173,8 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
                 >
                   <span className="text-white/80">{l.label}</span>
                   <span className="shrink-0 font-mono text-xs">
-                    <span className="text-white/70">
-                      {fmtOdds(l.marginalOdds)}
+                    <span className="text-white/85">
+                      {fmtOdds(l.juicedOdds ?? l.marginalOdds)}
                     </span>
                     {slip[i]?.marketOdds != null && (
                       <span className="text-accent">
@@ -187,7 +187,7 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
               ))}
             </div>
             <div className="mb-2 mt-1 text-[10px] text-white/30">
-              leg odds: model{" "}
+              leg odds: originated (30-cent line){" "}
               {slip.some((l) => l.marketOdds != null) && (
                 <>
                   / <span className="text-accent/70">market</span>
@@ -329,6 +329,12 @@ function GameCard({
                           label: `${p.player} ${
                             MARKET_LABEL[p.market] ?? p.market.toUpperCase()
                           } ${side === "over" ? "o" : "u"}${p.line.point}`,
+                          // Originated juiced odds from the contract — the price
+                          // the slip shows per leg.
+                          juicedOdds:
+                            side === "over"
+                              ? p.line.overOdds
+                              : p.line.underOdds,
                         });
                         return (
                           <div

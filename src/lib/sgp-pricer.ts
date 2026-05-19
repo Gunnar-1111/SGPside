@@ -69,6 +69,12 @@ export function probToAmerican(p: number): number {
     : Math.round(((1 - p) / p) * 100);
 }
 
+/** Vigged American odds — adds the per-side overlay before pricing. Default
+ *  3.5% per side ≈ 30-cent line, matching the family vig for prop origination. */
+export function probToAmericanVigged(p: number, vig = 0.035): number {
+  return probToAmerican(Math.min(0.97, p + vig));
+}
+
 /** Marginal P(stat > point) from a projection distribution. */
 function pOver(proj: Projection, point: number): number {
   if (proj.distribution === "bernoulli") {
@@ -103,13 +109,19 @@ export interface Leg {
   point: number;
   side: "over" | "under";
   projection: Projection;
+  // Originated juiced odds for THIS side — the price a bettor would actually
+  // take (matches the contract's `line.overOdds`/`underOdds` for props, the
+  // vigged equivalent for game-line legs). Null only for legs we couldn't
+  // attach a price to.
+  juicedOdds?: number | null;
 }
 
 export interface PricedLeg {
   label: string;
   side: "over" | "under";
   marginalProb: number;
-  marginalOdds: number;
+  marginalOdds: number;     // no-vig fair, from the model
+  juicedOdds: number | null; // originated price (30-cent line)
 }
 
 export interface SGPPrice {
@@ -192,6 +204,7 @@ export function priceSGP(
       side: l.side,
       marginalProb: marginal[i],
       marginalOdds: probToAmerican(marginal[i]),
+      juicedOdds: l.juicedOdds ?? null,
     })),
     jointProb,
     independentProb,
