@@ -17,7 +17,7 @@ interface Engine {
 //   COURTSIDE_URL=http://localhost:3000  (etc.)
 // DugoutSide / HoopSide join the registry once they expose /api/contract.
 const ENGINES: Engine[] = [
-  { name: "courtside", base: process.env.COURTSIDE_URL ?? "https://courtside.vercel.app" },
+  { name: "courtside", base: process.env.COURTSIDE_URL ?? "https://courtside-smoky.vercel.app" },
 ];
 
 /** Slate dates the hub prices — today + tomorrow, UTC, YYYY-MM-DD. */
