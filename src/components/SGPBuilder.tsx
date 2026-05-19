@@ -64,19 +64,24 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
     [slate],
   );
 
-  const inSlip = (key: string, side: "over" | "under") =>
-    slip.some((l) => l.key === key && l.side === side);
+  // Legs are identified by gameId + key — game-line legs share matrix keys
+  // ("game_total", "home_margin") across games, so the gameId is what keeps
+  // a total leg in game A distinct from one in game B.
+  const inSlip = (gameId: string, key: string, side: "over" | "under") =>
+    slip.some(
+      (l) => l.gameId === gameId && l.key === key && l.side === side,
+    );
 
   function toggle(leg: Leg, marketOdds: number | null) {
     setSlip((prev) => {
-      if (prev.some((l) => l.key === leg.key && l.side === leg.side)) {
-        return prev.filter(
-          (l) => !(l.key === leg.key && l.side === leg.side),
-        );
+      const sameSlot = (l: SlipLeg) =>
+        l.gameId === leg.gameId && l.key === leg.key;
+      if (prev.some((l) => sameSlot(l) && l.side === leg.side)) {
+        return prev.filter((l) => !(sameSlot(l) && l.side === leg.side));
       }
-      // Drop any other leg with the same key — enforces mutual exclusion
-      // (over vs under of a prop, home vs away of a moneyline/spread).
-      return [...prev.filter((l) => l.key !== leg.key), { ...leg, marketOdds }];
+      // Drop the opposite side of this same slot — enforces mutual exclusion
+      // (over vs under of a prop/total, home vs away of an ML/spread).
+      return [...prev.filter((l) => !sameSlot(l)), { ...leg, marketOdds }];
     });
   }
 
@@ -227,7 +232,7 @@ function GameCard({
   sg: SlateGame;
   open: boolean;
   onToggleOpen: () => void;
-  inSlip: (key: string, side: "over" | "under") => boolean;
+  inSlip: (gameId: string, key: string, side: "over" | "under") => boolean;
   toggle: (leg: Leg, marketOdds: number | null) => void;
 }) {
   const { game, sport, market } = sg;
@@ -275,7 +280,7 @@ function GameCard({
                 <GameLineRow
                   key={`${o.market}:${o.side}`}
                   opt={o}
-                  active={inSlip(o.leg.key, o.leg.side)}
+                  active={inSlip(game.gameId, o.leg.key, o.leg.side)}
                   onClick={() => toggle(o.leg, o.marketOdds)}
                 />
               ))}
@@ -320,13 +325,13 @@ function GameCard({
                             </span>
                             <button
                               onClick={() => toggle(mk("over"), null)}
-                              className={btnCls(inSlip(key, "over"))}
+                              className={btnCls(inSlip(game.gameId, key, "over"))}
                             >
                               O
                             </button>
                             <button
                               onClick={() => toggle(mk("under"), null)}
-                              className={btnCls(inSlip(key, "under"))}
+                              className={btnCls(inSlip(game.gameId, key, "under"))}
                             >
                               U
                             </button>
@@ -345,7 +350,7 @@ function GameCard({
   );
 }
 
-// ── one game-line option (ML or spread) ──────────────────────────
+// ── one game-line option (ML, spread, or total) ──────────────────
 
 function GameLineRow({
   opt,
@@ -356,18 +361,20 @@ function GameLineRow({
   active: boolean;
   onClick: () => void;
 }) {
-  const market =
-    opt.market === "ml"
-      ? opt.marketOdds != null
-        ? fmtOdds(opt.marketOdds)
-        : "n/a"
-      : opt.marketPoint != null
-        ? `${opt.marketPoint > 0 ? "+" : ""}${opt.marketPoint}`
-        : "n/a";
-  const model =
-    opt.market === "ml"
-      ? fmtOdds(opt.modelOdds)
-      : `${opt.modelPoint! > 0 ? "+" : ""}${opt.modelPoint}`;
+  // ML rows compare fair odds; spread rows compare the signed spread number;
+  // total rows compare the (unsigned) total number.
+  let model: string, market: string;
+  if (opt.market === "ml") {
+    model = fmtOdds(opt.modelOdds);
+    market = opt.marketOdds != null ? fmtOdds(opt.marketOdds) : "n/a";
+  } else if (opt.market === "spread") {
+    const sgn = (n: number) => (n > 0 ? `+${n}` : `${n}`);
+    model = opt.modelPoint != null ? sgn(opt.modelPoint) : "n/a";
+    market = opt.marketPoint != null ? sgn(opt.marketPoint) : "n/a";
+  } else {
+    model = opt.modelPoint != null ? `${opt.modelPoint}` : "n/a";
+    market = opt.marketPoint != null ? `${opt.marketPoint}` : "n/a";
+  }
 
   return (
     <button

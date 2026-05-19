@@ -27,6 +27,7 @@ export interface Prop {
 export interface GameLines {
   homeSpread: number;
   total: number;
+  totalStdev?: number; // sim stdev of the game total — drives total legs
   homeWinProb: number;
   awayWinProb: number;
 }
