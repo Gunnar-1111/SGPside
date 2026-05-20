@@ -1,14 +1,33 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { SlateGame, Prop, CorrelationBlock } from "@/lib/types";
-import { priceSGP, type Leg } from "@/lib/sgp-pricer";
+import { priceSGP, probToAmericanVigged, normInv, type Leg } from "@/lib/sgp-pricer";
 import { gameLineOptions, type GameLineOption } from "@/lib/game-legs";
 
-// A slip leg is a priceable Leg plus the market odds for that leg, when a
-// market number exists (moneyline legs). Props / spreads carry null — priceSGP
-// ignores the extra field.
-type SlipLeg = Leg & { marketOdds: number | null };
+// A slip leg is a priceable Leg plus optional book inputs. When `bookLine` or
+// `bookOdds` are set, the slip re-prices against the book's number — lets the
+// picker compare "ours at the book's line" vs "what the book charges," which
+// separates model disagreement from juice differences.
+type SlipLeg = Leg & {
+  marketOdds: number | null;
+  bookLine?: number | null;   // user-entered: the book's offered line (e.g. FD's u217.5)
+  bookOdds?: number | null;   // user-entered: the book's juiced odds for this side
+};
+
+// Which betting market is this leg? Derived from the slip leg's `key`/`point`
+// — game-line legs share `home_margin` (ML vs spread distinguished by point=0).
+function legMarket(l: { key: string; point: number }): "ml" | "spread" | "total" | "prop" {
+  if (l.key === "home_margin" && l.point === 0) return "ml";
+  if (l.key === "home_margin") return "spread";
+  if (l.key === "game_total") return "total";
+  return "prop";
+}
+
+// Implied probability from American odds (vigged).
+function impProb(american: number): number {
+  return american < 0 ? -american / (-american + 100) : 100 / (american + 100);
+}
 
 const MARKET_LABEL: Record<string, string> = {
   points: "PTS",
@@ -27,6 +46,44 @@ function btnCls(active: boolean): string {
       ? "bg-accent text-bg-primary"
       : "bg-white/[0.05] text-white/55 hover:text-white"
   }`;
+}
+
+// Numeric input that parses on change, with empty-string = null. Used for the
+// book overrides per leg + the slip-level book SGP odds field. Accepts a +
+// prefix so users can type American odds like "+676" naturally.
+function NumberInput({
+  value,
+  placeholder,
+  onChange,
+  width,
+}: {
+  value: number | null;
+  placeholder: string;
+  onChange: (n: number | null) => void;
+  width: string;
+}) {
+  const [raw, setRaw] = useState<string>(value != null ? String(value) : "");
+  // Keep the input in sync if the parent clears it (e.g. on slip clear).
+  useEffect(() => { setRaw(value != null ? String(value) : ""); }, [value]);
+  return (
+    <input
+      type="text"
+      inputMode="numeric"
+      value={raw}
+      placeholder={placeholder}
+      onChange={(e) => {
+        const v = e.target.value;
+        setRaw(v);
+        if (v === "" || v === "-" || v === "+") {
+          onChange(null);
+          return;
+        }
+        const n = parseFloat(v.replace(/^\+/, ""));
+        if (!Number.isNaN(n)) onChange(n);
+      }}
+      className={`${width} rounded border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 text-center font-mono text-[11px] text-white/85 placeholder:text-white/25 focus:border-accent/50 focus:outline-none`}
+    />
+  );
 }
 
 function Row({
@@ -53,6 +110,15 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
   const [openId, setOpenId] = useState<string | null>(
     slate[0]?.game.gameId ?? null,
   );
+  // The book's combined SGP price — user enters what FD/DK is offering for the
+  // whole slip, so the comparison block can show ours vs theirs at a glance.
+  const [bookSgpOdds, setBookSgpOdds] = useState<number | null>(null);
+
+  // Update a slip leg's `bookLine` or `bookOdds` by index. Null clears the
+  // override — the leg falls back to its original (market-anchored) point.
+  function updateLegBook(idx: number, patch: Partial<Pick<SlipLeg, "bookLine" | "bookOdds">>) {
+    setSlip((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
+  }
 
   // Every game's correlation block, keyed by gameId — passed to the pricer so
   // same-game legs stay correlated and cross-game legs go independent.
@@ -98,9 +164,77 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
     });
   }
 
+  // Slip with book overrides applied to the BET POINT. When the user supplies
+  // a `bookLine`, the leg re-prices against that threshold (pricer uses
+  // leg.point as the bet threshold; marginalProb falls out for free) AND the
+  // label is rewritten to show the bet line that's actually being priced —
+  // otherwise the label keeps the original point and looks like the override
+  // didn't take effect even though the math is using it.
+  const slipForPricing = useMemo<SlipLeg[]>(
+    () =>
+      slip.map((l) => {
+        if (l.bookLine == null) return l;
+        // Replace the trailing number in the leg's label with bookLine. Covers
+        // props ("Player PTS o29.5"), totals ("Over 218.5"), spreads ("NY -3.5").
+        // ML legs don't have bookLine inputs, so no relabel concern there.
+        const newLabel = l.label.replace(
+          /-?\d+(\.\d+)?$/,
+          l.bookLine % 1 === 0 ? String(l.bookLine) : l.bookLine.toFixed(1),
+        );
+        return { ...l, point: l.bookLine, label: newLabel };
+      }),
+    [slip],
+  );
   const price = useMemo(
-    () => (slip.length ? priceSGP(slip, corrByGame) : null),
-    [slip, corrByGame],
+    () => (slipForPricing.length ? priceSGP(slipForPricing, corrByGame) : null),
+    [slipForPricing, corrByGame],
+  );
+
+  // Parallel slip priced "as if" each leg had the book's per-leg fair prob
+  // (de-vigged from bookOdds). Same correlation matrix, same SGP hold — only
+  // the per-leg marginal probabilities are swapped to the book's view. Lets
+  // us isolate "projection disagreement" (price.ours vs priceAtBookOdds)
+  // from "correlation + juice disagreement" (priceAtBookOdds vs book's SGP).
+  //
+  // Legs missing bookLine OR bookOdds keep their original projection — the
+  // resulting price is a mix; only fully-overridden legs swap.
+  const slipAtBookOdds = useMemo<SlipLeg[]>(
+    () =>
+      slip.map((l) => {
+        if (l.bookLine == null || l.bookOdds == null) return l;
+        // Strip 3.5% per-side vig from book's quoted price (matches our hold
+        // convention so the engine vs book comparison is clean).
+        const vigged = impProb(l.bookOdds);
+        const fairForSide = Math.max(0.01, Math.min(0.99, vigged - 0.035));
+        // The book's no-vig prob applies to the SIDE the slip is on; convert
+        // back to pOver so we can solve for a synthetic projection mean.
+        const pOverFair = l.side === "over" ? fairForSide : 1 - fairForSide;
+        const sd =
+          l.projection.stdev && l.projection.stdev > 0
+            ? l.projection.stdev
+            : Math.sqrt(Math.max(l.projection.mean, 1));
+        // (bookLine - mean) / sd = normInv(1 - pOverFair)  ⇒  mean = bookLine - sd * z
+        const z = normInv(1 - pOverFair);
+        const newMean = l.bookLine - sd * z;
+        return {
+          ...l,
+          point: l.bookLine,
+          projection: { mean: newMean, stdev: sd, distribution: "normal" as const },
+        };
+      }),
+    [slip],
+  );
+  const priceAtBookOdds = useMemo(
+    () => (slipAtBookOdds.length ? priceSGP(slipAtBookOdds, corrByGame) : null),
+    [slipAtBookOdds, corrByGame],
+  );
+  // Only show the parallel price when AT LEAST ONE leg has full book overrides;
+  // otherwise the parallel result is identical to `price` and meaningless.
+  const anyBookOverride = slip.some(
+    (l) => l.bookLine != null && l.bookOdds != null,
+  );
+  const allBookOverride = slip.every(
+    (l) => l.bookLine != null && l.bookOdds != null,
   );
 
   // Group the slate by date for the picker.
@@ -150,7 +284,10 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
           </span>
           {slip.length > 0 && (
             <button
-              onClick={() => setSlip([])}
+              onClick={() => {
+                setSlip([]);
+                setBookSgpOdds(null);
+              }}
               className="text-[11px] text-white/35 hover:text-white/70"
             >
               clear
@@ -165,33 +302,57 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
           </p>
         ) : (
           <>
-            <div className="space-y-1.5">
-              {price.legs.map((l, i) => (
-                <div
-                  key={i}
-                  className="flex items-baseline justify-between gap-3 text-sm"
-                >
-                  <span className="text-white/80">{l.label}</span>
-                  <span className="shrink-0 font-mono text-xs">
-                    <span className="text-white/85">
-                      {fmtOdds(l.juicedOdds ?? l.marginalOdds)}
-                    </span>
-                    {slip[i]?.marketOdds != null && (
-                      <span className="text-accent">
-                        {" "}
-                        / {fmtOdds(slip[i].marketOdds!)}
+            <div className="space-y-3">
+              {price.legs.map((l, i) => {
+                const sl = slip[i];
+                const market = legMarket(sl);
+                // "Ours @ book line" = our vigged odds at whatever point is
+                // actually being priced (= bookLine if set, else original).
+                // marginalProb comes back from priceSGP already side-aware.
+                const oursJuicedAtPoint = probToAmericanVigged(l.marginalProb);
+                return (
+                  <div key={i} className="space-y-1">
+                    <div className="flex items-baseline justify-between gap-3 text-sm">
+                      <span className="text-white/80">{l.label}</span>
+                      <span className="shrink-0 font-mono text-xs">
+                        <span className="text-white/85">{fmtOdds(oursJuicedAtPoint)}</span>
+                        {sl?.bookOdds != null ? (
+                          <span className="text-accent"> / {fmtOdds(sl.bookOdds)}</span>
+                        ) : sl?.marketOdds != null ? (
+                          <span className="text-accent"> / {fmtOdds(sl.marketOdds)}</span>
+                        ) : null}
                       </span>
-                    )}
-                  </span>
-                </div>
-              ))}
+                    </div>
+                    {/* Book overrides — line + odds. ML legs hide the line input. */}
+                    <div className="flex items-center gap-1.5 pl-2 text-[11px] text-white/40">
+                      <span>book</span>
+                      {market !== "ml" && (
+                        <NumberInput
+                          value={sl?.bookLine ?? null}
+                          placeholder="line"
+                          width="w-14"
+                          onChange={(n) => updateLegBook(i, { bookLine: n })}
+                        />
+                      )}
+                      <NumberInput
+                        value={sl?.bookOdds ?? null}
+                        placeholder="odds"
+                        width="w-14"
+                        onChange={(n) => updateLegBook(i, { bookOdds: n })}
+                      />
+                      {sl?.bookLine != null && market !== "ml" && (
+                        <span className="font-mono text-white/30">
+                          orig {sl.point === Math.trunc(sl.point) ? sl.point : sl.point.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
-            <div className="mb-2 mt-1 text-[10px] text-white/30">
-              leg odds: originated (30-cent line){" "}
-              {slip.some((l) => l.marketOdds != null) && (
-                <>
-                  / <span className="text-accent/70">market</span>
-                </>
+            <div className="mt-2 text-[10px] text-white/30">
+              ours @ book line {slip.some((l) => l.bookOdds != null || l.marketOdds != null) && (
+                <>/ <span className="text-accent/70">book</span></>
               )}
             </div>
 
@@ -220,11 +381,86 @@ export default function SGPBuilder({ slate }: { slate: SlateGame[] }) {
                 </span>
               </div>
               <div className="flex items-baseline justify-between">
-                <span className="text-sm text-white/55">SGP price</span>
+                <span className="text-sm text-white/55">SGP price (ours)</span>
                 <span className="font-mono text-xl font-bold text-accent">
                   {fmtOdds(price.pricedOdds)}
                 </span>
               </div>
+            </div>
+
+            {/* ── SGP at book's per-leg odds (our engine, their probs) ─── */}
+            {anyBookOverride && priceAtBookOdds && (
+              <div className="mt-3 space-y-1 border-t border-white/[0.06] pt-3">
+                <div className="flex items-baseline justify-between text-xs text-white/45">
+                  <span>If we used book&apos;s per-leg odds</span>
+                  <span className="text-[10px] uppercase tracking-widest">
+                    {allBookOverride ? "all legs" : "partial"}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <span className="text-sm text-white/55">Joint prob</span>
+                  <span className="font-mono text-sm text-white/75">
+                    {(priceAtBookOdds.jointProb * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <span className="text-sm text-white/55">SGP price</span>
+                  <span className="font-mono text-base font-semibold text-white/85">
+                    {fmtOdds(priceAtBookOdds.pricedOdds)}
+                  </span>
+                </div>
+                <p className="pt-1 text-[10px] leading-snug text-white/30">
+                  Same correlation + hold as ours, but each leg&apos;s marginal swapped to
+                  the book&apos;s no-vig prob (book odds − 3.5% per side). Gap vs ours = projection
+                  disagreement; gap vs book&apos;s SGP price = correlation/juice gap.
+                </p>
+              </div>
+            )}
+
+            {/* ── Book SGP comparison ─────────────────────────── */}
+            <div className="mt-3 space-y-2 border-t border-white/[0.06] pt-3">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-sm text-white/55">Book SGP odds</span>
+                <NumberInput
+                  value={bookSgpOdds}
+                  placeholder="e.g. +676"
+                  width="w-24"
+                  onChange={setBookSgpOdds}
+                />
+              </div>
+              {bookSgpOdds != null && (() => {
+                const bookProb = impProb(bookSgpOdds);
+                const oursPriced = impProb(price.pricedOdds);
+                const oursFair = price.jointProb;
+                // Model gap = how much our fair prob differs from the book's implied. Positive
+                // → we think it's more likely than book's price reflects (potential edge).
+                const probGap = (oursFair - bookProb) * 100;
+                const ourHold = (oursPriced / oursFair - 1) * 100;
+                // Book's implied hold IF we assume the book's fair prob equals ours. That's a
+                // heuristic — if it's negative, the book is paying more than our fair (i.e. our
+                // model says it's a positive-EV bet); if positive and small (3-5%) the book
+                // holds about as much as we do; large positive means either the book holds a
+                // lot OR the book thinks the event is less likely than we do.
+                const impliedBookHold = (bookProb / oursFair - 1) * 100;
+                return (
+                  <div className="space-y-1 rounded bg-white/[0.02] p-2 text-xs">
+                    <Row label="Book implied prob" value={`${(bookProb * 100).toFixed(1)}%`} muted />
+                    <Row label="Our fair prob"     value={`${(oursFair * 100).toFixed(1)}%`} muted />
+                    <div className="flex items-baseline justify-between pt-1 text-white/70">
+                      <span>Model edge</span>
+                      <span className={`font-mono ${probGap > 0 ? "text-emerald-400" : probGap < 0 ? "text-rose-400" : ""}`}>
+                        {probGap >= 0 ? "+" : ""}{probGap.toFixed(1)}pp
+                      </span>
+                    </div>
+                    <Row label="Our hold" value={`${ourHold.toFixed(1)}%`} muted />
+                    <Row
+                      label="Book hold (assuming our fair)"
+                      value={`${impliedBookHold >= 0 ? "+" : ""}${impliedBookHold.toFixed(1)}%`}
+                      muted
+                    />
+                  </div>
+                );
+              })()}
             </div>
           </>
         )}
