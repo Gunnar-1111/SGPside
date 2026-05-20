@@ -28,13 +28,41 @@ import { normCdf, normInv, probToAmerican, probToAmericanVigged } from "./sgp-pr
 const FALLBACK_MARGIN_STD = 13; // used only at ~pick'em, where μ≈0 ⇒ σ undefined
 const FALLBACK_TOTAL_STD = 14; // used when a contract predates the totalStdev field
 
-/** Home-margin std implied by the contract (see file header). */
-function marginStd(game: Game): number {
-  const mu = -game.lines.homeSpread;
-  const p = Math.min(0.999, Math.max(0.001, game.lines.homeWinProb));
-  const z = normInv(p);
+/** American odds → implied probability. */
+function impProb(american: number): number {
+  return american < 0 ? -american / (-american + 100) : 100 / (american + 100);
+}
+
+/** Solve σ from a spread + win prob: P(margin>0) = Φ(μ/σ) ⇒ σ = μ / Φ⁻¹(p). */
+function stdFromSpreadAndWinProb(homeSpread: number, p: number): number {
+  const mu = -homeSpread;
+  const z = normInv(Math.min(0.999, Math.max(0.001, p)));
   if (Math.abs(z) < 0.05) return FALLBACK_MARGIN_STD;
   return Math.abs(mu / z);
+}
+
+/**
+ * Market-centered home-margin distribution {μ, σ}.
+ *
+ * Mirrors the totals policy: spread/ML legs price against the *market's* view
+ * of the game, with our model values reserved for the picker's comparison
+ * display. μ is the market home spread (sign-flipped). σ is solved from the
+ * market spread + the no-vig home win prob backed out of the market ML pair.
+ * Falls back to the contract's model values when ESPN hasn't posted the line.
+ */
+function marginDist(game: Game, market: MarketLines | null): { mu: number; sd: number } {
+  const modelMu = -game.lines.homeSpread;
+  const modelSd = stdFromSpreadAndWinProb(game.lines.homeSpread, game.lines.homeWinProb);
+  if (!market || market.homeSpread == null) return { mu: modelMu, sd: modelSd };
+  const mu = -market.homeSpread;
+  if (market.homeML == null || market.awayML == null) return { mu, sd: modelSd };
+  const hImp = impProb(market.homeML);
+  const aImp = impProb(market.awayML);
+  const sum = hImp + aImp;
+  if (sum <= 0) return { mu, sd: modelSd };
+  const hNoVig = hImp / sum; // de-vig two-way market
+  const sd = stdFromSpreadAndWinProb(market.homeSpread, hNoVig);
+  return { mu, sd };
 }
 
 export interface GameLineOption {
@@ -62,23 +90,25 @@ export function gameLineOptions(
   const { homeSpread, total, homeWinProb, awayWinProb } = game.lines;
   const fmt = (n: number) => (n > 0 ? `+${n}` : `${n}`);
 
-  // Home margin ~ Normal(μ, σ). Both moneyline AND spread legs are bets on
-  // this same latent, so both key to `home_margin` and correlate with player
-  // props through the copula. σ is backed out of the contract (see marginStd);
-  // P(margin > 0) then equals homeWinProb exactly, so the ML marginal is
-  // unchanged — it's just correlation-aware now.
-  const mu = -homeSpread; // expected home margin
-  const sd = marginStd(game);
+  // Home margin ~ Normal(μ, σ). ML and spread legs are bets on this same
+  // latent — both key to `home_margin` and correlate with props through the
+  // copula. Projection is MARKET-centered when ESPN has the line (mirrors
+  // the totals policy); falls back to model μ/σ otherwise.
+  const { mu, sd } = marginDist(game, market);
 
   // ── Moneyline — home margin > 0 ──────────────────────────────
+  const pHomeWin = 1 - normCdf((0 - mu) / sd); // market-implied if available
   const ml = (side: "home" | "away"): GameLineOption => {
-    const prob = side === "home" ? homeWinProb : awayWinProb;
+    const marketProb = side === "home" ? pHomeWin : 1 - pHomeWin;
+    // Picker's `modelOdds` keeps the contract's MODEL win prob so the
+    // picker still shows model-vs-market disagreement at a glance.
+    const modelProb = side === "home" ? homeWinProb : awayWinProb;
     const team = side === "home" ? home : away;
     return {
       market: "ml",
       side,
       label: `${team} ML`,
-      modelOdds: probToAmerican(prob),
+      modelOdds: probToAmerican(modelProb),
       modelPoint: null,
       marketOdds: side === "home" ? market?.homeML ?? null : market?.awayML ?? null,
       marketPoint: null,
@@ -89,7 +119,7 @@ export function gameLineOptions(
         point: 0, // home wins ⇔ home margin > 0
         side: side === "home" ? "over" : "under",
         projection: { mean: mu, stdev: sd, distribution: "normal" },
-        juicedOdds: probToAmericanVigged(prob),
+        juicedOdds: probToAmericanVigged(marketProb),
       },
     };
   };
@@ -98,16 +128,22 @@ export function gameLineOptions(
   const betSpread = market?.homeSpread ?? homeSpread; // home perspective
   const spreadThr = -betSpread; // home covers ⇔ home margin > spreadThr
   const pHomeCovers = 1 - normCdf((spreadThr - mu) / sd);
+  // Model-centered cover prob is kept for the picker's modelOdds, so the
+  // picker still shows our view of the market spread vs the market's price.
+  const modelMu = -homeSpread;
+  const modelSd = stdFromSpreadAndWinProb(homeSpread, homeWinProb);
+  const pHomeCoversModel = 1 - normCdf((spreadThr - modelMu) / modelSd);
 
   const spread = (side: "home" | "away"): GameLineOption => {
     const team = side === "home" ? home : away;
     const teamSpread = side === "home" ? betSpread : -betSpread;
     const prob = side === "home" ? pHomeCovers : 1 - pHomeCovers;
+    const modelProb = side === "home" ? pHomeCoversModel : 1 - pHomeCoversModel;
     return {
       market: "spread",
       side,
       label: `${team} ${fmt(teamSpread)}`,
-      modelOdds: probToAmerican(prob),
+      modelOdds: probToAmerican(modelProb),
       modelPoint: side === "home" ? homeSpread : -homeSpread,
       marketOdds: null, // ESPN scoreboard gives the spread number, not its juice
       marketPoint: side === "home"
